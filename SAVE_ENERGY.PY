@@ -4,6 +4,7 @@ import time
 import ctypes
 import tkinter as tk
 import multiprocessing
+import subprocess
 
 # --- WINDOWS API STRUCTURES ---
 class LASTINPUTINFO(ctypes.Structure):
@@ -12,16 +13,56 @@ class LASTINPUTINFO(ctypes.Structure):
         ("dwTime", ctypes.c_uint),
     ]
 
+class POINT(ctypes.Structure):
+    _fields_ = [
+        ("x", ctypes.c_long),
+        ("y", ctypes.c_long),
+    ]
+
 # --- HELPER FUNCTIONS ---
 def get_raw_os_idle_time():
     lii = LASTINPUTINFO()
     lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
-
     if ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
         current_ticks = ctypes.windll.kernel32.GetTickCount()
         idle_ticks = (current_ticks - lii.dwTime) & 0xFFFFFFFF
         return idle_ticks / 1000.0
     return 0.0
+
+def get_cursor_pos():
+    pt = POINT()
+    ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+    return (pt.x, pt.y)
+
+def check_power_requests():
+    """Queries Windows powercfg to find out exactly which app is blocking idle."""
+    try:
+        result = subprocess.run(
+            ['powercfg', '/requests'], 
+            capture_output=True, 
+            text=True, 
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        lines = result.stdout.split('\n')
+        
+        active_blockers = []
+        current_category = ""
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            if line.isupper() and line.endswith(":"):
+                current_category = line[:-1]
+            elif "None." not in line and current_category:
+                active_blockers.append(f"[{current_category}] {line}")
+                
+        if active_blockers:
+            return " | ".join(active_blockers)
+        return "No explicit power requests found (Could be a raw virtual keystroke)"
+    except Exception as e:
+        return f"Could not check powercfg: {e}"
 
 def is_media_playing():
     try:
@@ -42,7 +83,7 @@ def is_media_playing():
                         "media player", "movies & tv", "g-force"
                     ]
                     if any(keyword in title for keyword in media_keywords):
-                        found_media[0] = title # Store the title to know what caused it
+                        found_media[0] = title 
                         return False
             return True
         ctypes.windll.user32.EnumWindows(enum_windows_callback, 0)
@@ -83,7 +124,6 @@ def show_countdown_window():
     root.attributes("-topmost", True)
     root.overrideredirect(True)
 
-    # Size calculation for 90% of screen
     screen_w = root.winfo_screenwidth()
     screen_h = root.winfo_screenheight()
     win_w, win_h = int(screen_w * 0.90), int(screen_h * 0.90)
@@ -98,12 +138,11 @@ def show_countdown_window():
     tk.Label(container, text="System idle. Press any key or move mouse to abort shutdown.",
              font=("Consolas", 24, "bold"), fg="#ff5555", bg="#000000").pack(pady=40)
     
-    # Styled to mimic the red digital LED layout
     timer_label = tk.Label(container, text="09:00:00", font=("DS-Digital", 200, "bold"), fg="#FF0000", bg="#000000")
     timer_label.pack()
 
-    # Countdown for 9 minutes (540 seconds)
-    COUNTDOWN_SECONDS = 9 * 60
+    # Remaining 9 minutes for the popup to complete the full 10 minutes
+    COUNTDOWN_SECONDS = 9 * 60 
     start_time = time.time()
 
     def update_window():
@@ -113,7 +152,6 @@ def show_countdown_window():
         
         os_idle = get_raw_os_idle_time()
         
-        # Abort if user activity detected (mouse, keyboard, media, or file copy)
         if os_idle < 2 or is_file_copy_active() or is_media_playing():
             root.destroy()
             return
@@ -138,17 +176,21 @@ def show_countdown_window():
 
 # --- MAIN WORKER ---
 def shutdown_monitor_worker():
-    # Trigger popup after exactly 60 seconds (1 minute) of true idle
-    IDLE_WAIT_BEFORE_POPUP = 1 * 60  
+    # Only wait 60 seconds in the console before launching the UI
+    IDLE_WAIT_BEFORE_POPUP = 60  
+    
     last_activity_timestamp = time.time()
     previous_effective_idle = 0
+    last_cursor_pos = get_cursor_pos()
     
-    # Print custom banner
     print("=" * 70)
     print("                           SAVE ENERGY")
     print("=" * 70)
-    print("for customization / buy me a coffee please reach us out at ")
-    print("-DXEVOLUTION.AB@GMAIL.COM")
+    print(" An auto-shutdown Python script that saves energy by turning off")
+    print(" your PC after 10 minutes of inactivity.")
+    print("=" * 70)
+    print(" For customization / buy me a coffee please reach us out at:")
+    print(" - DXEVOLUTION.AB@GMAIL.COM")
     print("=" * 70)
     print(f"[{time.strftime('%H:%M:%S')}] Monitoring active. Waiting for system to idle...\n")
 
@@ -157,42 +199,50 @@ def shutdown_monitor_worker():
             os_idle_seconds = get_raw_os_idle_time()
             current_time = time.time()
             python_idle_seconds = current_time - last_activity_timestamp
+            current_cursor_pos = get_cursor_pos()
             
-            reset_reason = None
+            detailed_reset_reason = None
+            power_request_info = None
             
-            # 1. Check for File Copying
             copy_window_title = is_file_copy_active()
-            # 2. Check for Media/Game windows
             media_window_title = is_media_playing()
             
             if copy_window_title:
                 last_activity_timestamp = current_time
-                reset_reason = f"File Transfer Active ['{copy_window_title}']"
+                detailed_reset_reason = f"[Software] File Transfer Active: '{copy_window_title}'"
             elif media_window_title:
                 last_activity_timestamp = current_time
-                reset_reason = f"Media/App Open ['{media_window_title}']"
+                detailed_reset_reason = f"[Software] Media/App Running: '{media_window_title}'"
             elif os_idle_seconds < python_idle_seconds:
-                # 3. Check for physical Mouse or Keyboard input
                 last_activity_timestamp = current_time - os_idle_seconds
-                reset_reason = "Mouse Movement or Keyboard Input Detected"
+                
+                if current_cursor_pos != last_cursor_pos:
+                    detailed_reset_reason = f"[Hardware] Mouse Movement (Coordinates changed from {last_cursor_pos} to {current_cursor_pos})"
+                else:
+                    detailed_reset_reason = "[Virtual/Keyboard] Phantom keypress or background app detected."
+                    power_request_info = check_power_requests()
             
             effective_idle_seconds = current_time - last_activity_timestamp
             
-            # If the timer was counting down (past 2 seconds) and suddenly jumped back, log it!
-            if reset_reason and effective_idle_seconds < previous_effective_idle and previous_effective_idle > 2.0:
-                # Clear the countdown line smoothly
+            if detailed_reset_reason and effective_idle_seconds < previous_effective_idle and previous_effective_idle > 3.0:
                 sys.stdout.write("\r" + " " * 80 + "\r")
-                sys.stdout.write(f"[{time.strftime('%H:%M:%S')}] Timer Reset! Cause: {reset_reason}\n")
+                print(f"[{time.strftime('%H:%M:%S')}] ⚠️ TIMER RESET TRIGGERED!")
+                print(f"[{time.strftime('%H:%M:%S')}] Cause: {detailed_reset_reason}")
+                
+                if power_request_info:
+                    print(f"[{time.strftime('%H:%M:%S')}] App Culprit: {power_request_info}")
+                    
+                print("-" * 70)
                 sys.stdout.flush()
 
             previous_effective_idle = effective_idle_seconds
             remaining_seconds = max(0, int(IDLE_WAIT_BEFORE_POPUP - effective_idle_seconds))
+            last_cursor_pos = current_cursor_pos
 
-            # Real-time console countdown
-            sys.stdout.write(f"\r[STATUS] Idle countdown before Save Energy: {remaining_seconds:02d} seconds remaining...   ")
+            # Strictly 2-digit format counting down from 60 in-place
+            sys.stdout.write(f"\r[STATUS] No activity counter, countdown will begin in {remaining_seconds:02d} seconds...   ")
             sys.stdout.flush()
 
-            # Launch UI if we hit the idle threshold
             if effective_idle_seconds >= IDLE_WAIT_BEFORE_POPUP:
                 sys.stdout.write(f"\n\n[{time.strftime('%H:%M:%S')}] Idle threshold reached! Launching countdown window...\n")
                 sys.stdout.flush()
@@ -201,11 +251,9 @@ def shutdown_monitor_worker():
                 p.start()
                 p.join()  
                 
-                # If we get here, it means the window closed due to user activity
-                sys.stdout.write(f"[{time.strftime('%H:%M:%S')}] Activity detected. Shutdown aborted. Resetting timer...\n\n")
+                sys.stdout.write(f"[{time.strftime('%H:%M:%S')}] Activity detected. Aborted. Resetting timer...\n\n")
                 sys.stdout.flush()
                 
-                # Reset timers after UI closure
                 last_activity_timestamp = time.time()
                 previous_effective_idle = 0
                 
@@ -215,8 +263,6 @@ def shutdown_monitor_worker():
         time.sleep(1)
 
 if __name__ == "__main__":
-    # Set custom title for the terminal window
     ctypes.windll.kernel32.SetConsoleTitleW("Save Energy")
-    # Required for multiprocessing safely on Windows
     multiprocessing.freeze_support()
     shutdown_monitor_worker()
