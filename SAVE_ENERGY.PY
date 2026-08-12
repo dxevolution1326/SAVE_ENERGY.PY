@@ -42,7 +42,7 @@ def is_media_playing():
                         "media player", "movies & tv", "g-force"
                     ]
                     if any(keyword in title for keyword in media_keywords):
-                        found_media[0] = True
+                        found_media[0] = title # Store the title to know what caused it
                         return False
             return True
         ctypes.windll.user32.EnumWindows(enum_windows_callback, 0)
@@ -68,7 +68,7 @@ def is_file_copy_active():
                             "items remaining", "calculating",
                         ]
                     ):
-                        found_copy_dialog[0] = True
+                        found_copy_dialog[0] = title
                         return False
             return True
         ctypes.windll.user32.EnumWindows(enum_windows_callback, 0)
@@ -141,6 +141,7 @@ def shutdown_monitor_worker():
     # Trigger popup after exactly 60 seconds (1 minute) of true idle
     IDLE_WAIT_BEFORE_POPUP = 1 * 60  
     last_activity_timestamp = time.time()
+    previous_effective_idle = 0
     
     # Print custom banner
     print("=" * 70)
@@ -157,13 +158,34 @@ def shutdown_monitor_worker():
             current_time = time.time()
             python_idle_seconds = current_time - last_activity_timestamp
             
-            # Reset idle timers if media/copying is active, or if OS detects movement
-            if is_file_copy_active() or is_media_playing():
+            reset_reason = None
+            
+            # 1. Check for File Copying
+            copy_window_title = is_file_copy_active()
+            # 2. Check for Media/Game windows
+            media_window_title = is_media_playing()
+            
+            if copy_window_title:
                 last_activity_timestamp = current_time
+                reset_reason = f"File Transfer Active ['{copy_window_title}']"
+            elif media_window_title:
+                last_activity_timestamp = current_time
+                reset_reason = f"Media/App Open ['{media_window_title}']"
             elif os_idle_seconds < python_idle_seconds:
+                # 3. Check for physical Mouse or Keyboard input
                 last_activity_timestamp = current_time - os_idle_seconds
+                reset_reason = "Mouse Movement or Keyboard Input Detected"
             
             effective_idle_seconds = current_time - last_activity_timestamp
+            
+            # If the timer was counting down (past 2 seconds) and suddenly jumped back, log it!
+            if reset_reason and effective_idle_seconds < previous_effective_idle and previous_effective_idle > 2.0:
+                # Clear the countdown line smoothly
+                sys.stdout.write("\r" + " " * 80 + "\r")
+                sys.stdout.write(f"[{time.strftime('%H:%M:%S')}] Timer Reset! Cause: {reset_reason}\n")
+                sys.stdout.flush()
+
+            previous_effective_idle = effective_idle_seconds
             remaining_seconds = max(0, int(IDLE_WAIT_BEFORE_POPUP - effective_idle_seconds))
 
             # Real-time console countdown
@@ -182,7 +204,10 @@ def shutdown_monitor_worker():
                 # If we get here, it means the window closed due to user activity
                 sys.stdout.write(f"[{time.strftime('%H:%M:%S')}] Activity detected. Shutdown aborted. Resetting timer...\n\n")
                 sys.stdout.flush()
+                
+                # Reset timers after UI closure
                 last_activity_timestamp = time.time()
+                previous_effective_idle = 0
                 
         except Exception:
             pass
