@@ -2,68 +2,82 @@ import sys
 import os
 import time
 import ctypes
+from ctypes import wintypes
 import tkinter as tk
 import multiprocessing
-import subprocess
+import threading
 
-# --- WINDOWS API STRUCTURES ---
-class LASTINPUTINFO(ctypes.Structure):
+# --- LOW-LEVEL WINDOWS HOOKS ---
+user32 = ctypes.WinDLL('user32', use_last_error=True)
+
+WH_KEYBOARD_LL = 13
+WH_MOUSE_LL = 14
+LLKHF_INJECTED = 0x10
+LLMHF_INJECTED = 0x01
+
+class KBDLLHOOKSTRUCT(ctypes.Structure):
     _fields_ = [
-        ("cbSize", ctypes.c_uint),
-        ("dwTime", ctypes.c_uint),
+        ("vkCode", wintypes.DWORD), 
+        ("scanCode", wintypes.DWORD), 
+        ("flags", wintypes.DWORD), 
+        ("time", wintypes.DWORD), 
+        ("dwExtraInfo", wintypes.PULONG)
     ]
 
-class POINT(ctypes.Structure):
+class MSLLHOOKSTRUCT(ctypes.Structure):
     _fields_ = [
-        ("x", ctypes.c_long),
-        ("y", ctypes.c_long),
+        ("pt", wintypes.POINT), 
+        ("mouseData", wintypes.DWORD), 
+        ("flags", wintypes.DWORD), 
+        ("time", wintypes.DWORD), 
+        ("dwExtraInfo", wintypes.PULONG)
     ]
+
+# Define LRESULT explicitly for 64-bit compatibility
+LRESULT = ctypes.c_ssize_t
+HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+
+# =====================================================================
+# THE FIX: Explicitly define argtypes so lParam doesn't overflow
+user32.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
+user32.CallNextHookEx.restype = LRESULT
+# =====================================================================
+
+shared_activity_time = None
+cmp_kb = None
+cmp_ms = None
+
+def keyboard_handler(nCode, wParam, lParam):
+    if nCode >= 0:
+        info = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+        if not (info.flags & LLKHF_INJECTED):
+            shared_activity_time.value = time.time()
+    return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+def mouse_handler(nCode, wParam, lParam):
+    if nCode >= 0:
+        info = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+        if not (info.flags & LLMHF_INJECTED):
+            shared_activity_time.value = time.time()
+    return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+def start_input_hooks(shared_val):
+    global shared_activity_time, cmp_kb, cmp_ms
+    shared_activity_time = shared_val
+    
+    cmp_kb = HOOKPROC(keyboard_handler)
+    cmp_ms = HOOKPROC(mouse_handler)
+    
+    user32.SetWindowsHookExW(WH_KEYBOARD_LL, cmp_kb, None, 0)
+    user32.SetWindowsHookExW(WH_MOUSE_LL, cmp_ms, None, 0)
+    
+    msg = wintypes.MSG()
+    while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+        user32.TranslateMessage(ctypes.byref(msg))
+        user32.DispatchMessageW(ctypes.byref(msg))
+
 
 # --- HELPER FUNCTIONS ---
-def get_raw_os_idle_time():
-    lii = LASTINPUTINFO()
-    lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
-    if ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
-        current_ticks = ctypes.windll.kernel32.GetTickCount()
-        idle_ticks = (current_ticks - lii.dwTime) & 0xFFFFFFFF
-        return idle_ticks / 1000.0
-    return 0.0
-
-def get_cursor_pos():
-    pt = POINT()
-    ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
-    return (pt.x, pt.y)
-
-def check_power_requests():
-    """Queries Windows powercfg to find out exactly which app is blocking idle."""
-    try:
-        result = subprocess.run(
-            ['powercfg', '/requests'], 
-            capture_output=True, 
-            text=True, 
-            creationflags=subprocess.CREATE_NO_WINDOW
-        )
-        lines = result.stdout.split('\n')
-        
-        active_blockers = []
-        current_category = ""
-        
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            
-            if line.isupper() and line.endswith(":"):
-                current_category = line[:-1]
-            elif "None." not in line and current_category:
-                active_blockers.append(f"[{current_category}] {line}")
-                
-        if active_blockers:
-            return " | ".join(active_blockers)
-        return "No explicit power requests found (Could be a raw virtual keystroke)"
-    except Exception as e:
-        return f"Could not check powercfg: {e}"
-
 def is_media_playing():
     try:
         found_media = [False]
@@ -117,8 +131,9 @@ def is_file_copy_active():
     except Exception:
         return False
 
+
 # --- UI COUNTDOWN LOGIC ---
-def show_countdown_window():
+def show_countdown_window(shared_val):
     root = tk.Tk()
     root.title("Save Energy Mode")
     root.attributes("-topmost", True)
@@ -141,7 +156,6 @@ def show_countdown_window():
     timer_label = tk.Label(container, text="09:00:00", font=("DS-Digital", 200, "bold"), fg="#FF0000", bg="#000000")
     timer_label.pack()
 
-    # Remaining 9 minutes for the popup to complete the full 10 minutes
     COUNTDOWN_SECONDS = 9 * 60 
     start_time = time.time()
 
@@ -150,9 +164,9 @@ def show_countdown_window():
         root.lift()
         root.focus_force()
         
-        os_idle = get_raw_os_idle_time()
+        real_idle_seconds = time.time() - shared_val.value
         
-        if os_idle < 2 or is_file_copy_active() or is_media_playing():
+        if real_idle_seconds < 2 or is_file_copy_active() or is_media_playing():
             root.destroy()
             return
 
@@ -174,14 +188,17 @@ def show_countdown_window():
     root.after(30, update_window)
     root.mainloop()
 
+
 # --- MAIN WORKER ---
 def shutdown_monitor_worker():
-    # Only wait 60 seconds in the console before launching the UI
     IDLE_WAIT_BEFORE_POPUP = 60  
     
-    last_activity_timestamp = time.time()
+    shared_val = multiprocessing.Value('d', time.time())
+    
+    hook_thread = threading.Thread(target=start_input_hooks, args=(shared_val,), daemon=True)
+    hook_thread.start()
+    
     previous_effective_idle = 0
-    last_cursor_pos = get_cursor_pos()
     
     print("=" * 70)
     print("                           SAVE ENERGY")
@@ -196,50 +213,35 @@ def shutdown_monitor_worker():
 
     while True:
         try:
-            os_idle_seconds = get_raw_os_idle_time()
             current_time = time.time()
-            python_idle_seconds = current_time - last_activity_timestamp
-            current_cursor_pos = get_cursor_pos()
-            
-            detailed_reset_reason = None
-            power_request_info = None
             
             copy_window_title = is_file_copy_active()
             media_window_title = is_media_playing()
             
+            detailed_reset_reason = None
+            
             if copy_window_title:
-                last_activity_timestamp = current_time
+                shared_val.value = current_time
                 detailed_reset_reason = f"[Software] File Transfer Active: '{copy_window_title}'"
             elif media_window_title:
-                last_activity_timestamp = current_time
+                shared_val.value = current_time
                 detailed_reset_reason = f"[Software] Media/App Running: '{media_window_title}'"
-            elif os_idle_seconds < python_idle_seconds:
-                last_activity_timestamp = current_time - os_idle_seconds
-                
-                if current_cursor_pos != last_cursor_pos:
-                    detailed_reset_reason = f"[Hardware] Mouse Movement (Coordinates changed from {last_cursor_pos} to {current_cursor_pos})"
-                else:
-                    detailed_reset_reason = "[Virtual/Keyboard] Phantom keypress or background app detected."
-                    power_request_info = check_power_requests()
             
-            effective_idle_seconds = current_time - last_activity_timestamp
+            effective_idle_seconds = current_time - shared_val.value
             
-            if detailed_reset_reason and effective_idle_seconds < previous_effective_idle and previous_effective_idle > 3.0:
+            if not detailed_reset_reason and effective_idle_seconds < previous_effective_idle - 1:
+                detailed_reset_reason = "[Hardware] Physical Mouse or Keyboard Input Detected"
+            
+            if detailed_reset_reason and previous_effective_idle > 3.0 and effective_idle_seconds < previous_effective_idle:
                 sys.stdout.write("\r" + " " * 80 + "\r")
                 print(f"[{time.strftime('%H:%M:%S')}] ⚠️ TIMER RESET TRIGGERED!")
                 print(f"[{time.strftime('%H:%M:%S')}] Cause: {detailed_reset_reason}")
-                
-                if power_request_info:
-                    print(f"[{time.strftime('%H:%M:%S')}] App Culprit: {power_request_info}")
-                    
                 print("-" * 70)
                 sys.stdout.flush()
 
             previous_effective_idle = effective_idle_seconds
             remaining_seconds = max(0, int(IDLE_WAIT_BEFORE_POPUP - effective_idle_seconds))
-            last_cursor_pos = current_cursor_pos
 
-            # Strictly 2-digit format counting down from 60 in-place
             sys.stdout.write(f"\r[STATUS] No activity counter, countdown will begin in {remaining_seconds:02d} seconds...   ")
             sys.stdout.flush()
 
@@ -247,17 +249,17 @@ def shutdown_monitor_worker():
                 sys.stdout.write(f"\n\n[{time.strftime('%H:%M:%S')}] Idle threshold reached! Launching countdown window...\n")
                 sys.stdout.flush()
                 
-                p = multiprocessing.Process(target=show_countdown_window)
+                p = multiprocessing.Process(target=show_countdown_window, args=(shared_val,))
                 p.start()
                 p.join()  
                 
                 sys.stdout.write(f"[{time.strftime('%H:%M:%S')}] Activity detected. Aborted. Resetting timer...\n\n")
                 sys.stdout.flush()
                 
-                last_activity_timestamp = time.time()
+                shared_val.value = time.time()
                 previous_effective_idle = 0
                 
-        except Exception:
+        except Exception as e:
             pass
         
         time.sleep(1)
